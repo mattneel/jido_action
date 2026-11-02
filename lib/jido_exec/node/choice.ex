@@ -127,6 +127,8 @@ defmodule Jido.Exec.Node.Choice do
 
   def pass({:jido_nested_flow_frame, 1, _parent, _child} = frame), do: {:ok, frame}
 
+  def pass(%Jido.Exec.Frame.Continuation{} = frame), do: {:ok, frame}
+
   defp connect_from(workflow, [], child), do: Workflow.add_step(workflow, child)
   defp connect_from(workflow, [parent], child), do: Workflow.add_step(workflow, parent, child)
   defp connect_from(workflow, parents, child), do: Workflow.add_step(workflow, parents, child)

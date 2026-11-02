@@ -70,7 +70,13 @@ defmodule Jido.Exec.Node.Input do
              node_path: node.node_path,
              phase: :subflow_input
            }) do
-      {:ok, Frame.nest(parent, params)}
+      {:ok,
+       Frame.nest(
+         parent,
+         params,
+         Map.get(context, :frame_mode, :full),
+         Map.get(context, :frame_store)
+       )}
     end
   end
 

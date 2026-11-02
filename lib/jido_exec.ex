@@ -172,14 +172,19 @@ defmodule Jido.Exec do
     with {:ok, instruction} <- Instruction.resolve(target, params, context),
          {:ok, instruction} <- validate_flow_input(instruction),
          :ok <- validate_durable_instruction(instruction),
+         {:ok, managed_context} <- managed_context(instruction.context),
+         {:ok, state_backend, frame_mode} <- managed_runtime_options(opts, managed_context),
          {:ok, workflow} <- compile(%{instruction | context: %{}}),
+         workflow = Workflow.configure_state_backend(workflow, state_backend),
          :ok <- reject_waits(workflow),
+         {:ok, managed_context, input} <-
+           managed_frame_setup(instruction, managed_context, state_backend, frame_mode),
          {:ok, policy, worker_opts} <- managed_options(runner, execution_id, opts),
          {:ok, pid} <-
            Runic.Runner.start_workflow(runner, execution_id, workflow, worker_opts) do
-      case Runic.Runner.start_execution(runner, execution_id, execution_input(instruction),
+      case Runic.Runner.start_execution(runner, execution_id, input,
              execution_id: managed_identity(execution_id),
-             run_context: %{_global: durable_context(instruction.context)},
+             run_context: %{_global: durable_context(managed_context)},
              scheduler_policies: [{:default, Map.from_struct(policy)}]
            ) do
         {:ok, _scope_id} ->
@@ -214,15 +219,22 @@ defmodule Jido.Exec do
   def resume(runner, execution_id, context \\ %{}, opts \\ []) do
     with {:ok, rehydration, fallback?, opts} <- resume_options(runner, opts),
          {:ok, context} <- runtime_context(context),
-         :ok <- Portable.validate(context, :context),
+         {:ok, managed_context} <- managed_context(context),
+         :ok <- Portable.validate(managed_context, :context),
          {:ok, policy, worker_opts} <- managed_options(runner, execution_id, opts) do
       resume_opts =
         worker_opts ++
           [
             rehydration: rehydration,
-            run_context: %{_global: durable_context(context)},
             scheduler_policies: [{:default, Map.from_struct(policy)}]
           ]
+
+      resume_opts =
+        if map_size(managed_context) == 0 do
+          resume_opts
+        else
+          Keyword.put(resume_opts, :run_context, %{_global: durable_context(managed_context)})
+        end
 
       runner
       |> resume_runner(execution_id, resume_opts, fallback?)
@@ -317,7 +329,53 @@ defmodule Jido.Exec do
 
   defp run_workflow(workflow, input, context, kind, opts) do
     with {:ok, policy, react_opts} <- execution_options(opts, kind) do
+      state_backend =
+        Keyword.get(opts, :state_backend, Map.get(context, :__jido_state_backend__, :original))
+
+      frame_mode =
+        Keyword.get(
+          opts,
+          :frame_mode,
+          Map.get(
+            context,
+            :__jido_frame_mode__,
+            if(state_backend == :original, do: :full, else: :continuation)
+          )
+        )
+
+      inherited_store = Map.get(context, :__jido_frame_store__)
+
+      frame_store =
+        if frame_mode == :continuation and kind == :flow do
+          inherited_store || new_frame_store(state_backend)
+        end
+
+      input =
+        if frame_store do
+          case input do
+            %Jido.Exec.Frame.Continuation{} -> input
+            _ -> Jido.Exec.Frame.root(input, frame_store)
+          end
+        else
+          input
+        end
+
+      workflow = Workflow.configure_state_backend(workflow, state_backend)
+
       context = Jido.Exec.Runtime.context(context)
+
+      context =
+        if frame_store do
+          Map.merge(context, %{
+            frame_mode: frame_mode,
+            frame_store: frame_store,
+            __jido_state_backend__: state_backend,
+            __jido_frame_mode__: frame_mode,
+            __jido_frame_store__: frame_store
+          })
+        else
+          context
+        end
 
       {workflow, observation} =
         workflow
@@ -511,7 +569,9 @@ defmodule Jido.Exec do
         :backoff,
         :base_delay_ms,
         :max_delay_ms,
-        :max_concurrency
+        :max_concurrency,
+        :state_backend,
+        :frame_mode
       ]
 
       case Keyword.keys(opts) -- allowed do
@@ -622,7 +682,9 @@ defmodule Jido.Exec do
       :scheduler,
       :scheduler_opts,
       :hooks,
-      :promise_opts
+      :promise_opts,
+      :state_backend,
+      :frame_mode
     ]
 
     if Keyword.keyword?(opts) do
@@ -834,8 +896,71 @@ defmodule Jido.Exec do
 
   defp validate_durable_instruction(instruction), do: Jido.Exec.Runtime.portable(instruction)
 
-  defp durable_context(context) do
-    Jido.Exec.Runtime.context(context, true)
+  defp durable_context(context), do: Jido.Exec.Runtime.context(context, true)
+
+  defp managed_context(context) when is_map(context), do: {:ok, context}
+
+  defp managed_context(_context) do
+    {:error, Jido.Action.Error.config_error("managed context must be a map", %{})}
+  end
+
+  defp new_frame_store(:owner_map), do: Jido.Exec.Frame.Store.OwnerMap.new()
+  defp new_frame_store(_backend), do: Jido.Exec.Frame.Store.Ets.new()
+
+  defp managed_runtime_options(opts, context) do
+    backend =
+      Keyword.get(opts, :state_backend, Map.get(context, :__jido_state_backend__, :original))
+
+    frame_mode =
+      Keyword.get(
+        opts,
+        :frame_mode,
+        Map.get(
+          context,
+          :__jido_frame_mode__,
+          if(backend == :original, do: :full, else: :continuation)
+        )
+      )
+
+    cond do
+      not is_atom(backend) ->
+        {:error,
+         Jido.Action.Error.config_error("invalid state backend", %{state_backend: backend})}
+
+      backend == :original and frame_mode == :continuation ->
+        {:error,
+         Jido.Action.Error.config_error(
+           "managed continuation requires a normalized state backend",
+           %{frame_mode: frame_mode}
+         )}
+
+      frame_mode not in [:full, :continuation] ->
+        {:error, Jido.Action.Error.config_error("invalid frame mode", %{frame_mode: frame_mode})}
+
+      true ->
+        {:ok, backend, frame_mode}
+    end
+  end
+
+  defp managed_frame_setup(instruction, context, state_backend, frame_mode) do
+    context =
+      context
+      |> Map.put(:__jido_state_backend__, state_backend)
+      |> Map.put(:__jido_frame_mode__, frame_mode)
+      |> Map.put(:frame_mode, frame_mode)
+
+    if frame_mode == :continuation and instruction.kind == :flow do
+      store = new_frame_store(state_backend)
+
+      context =
+        context
+        |> Map.put(:__jido_frame_store__, store)
+        |> Map.put(:frame_store, store)
+
+      {:ok, context, Frame.root(execution_input(instruction), store)}
+    else
+      {:ok, context, execution_input(instruction)}
+    end
   end
 
   defp runtime_context(nil), do: {:ok, %{}}

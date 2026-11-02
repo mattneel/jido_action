@@ -6,6 +6,13 @@ defmodule Jido.Exec.Portable do
 
   @doc false
   @spec validate(term(), atom()) :: :ok | {:error, Exception.t()}
+  def validate(%Jido.Exec.Frame.Continuation{} = frame, field) do
+    frame
+    |> Map.from_struct()
+    |> Map.delete(:store)
+    |> validate(field)
+  end
+
   def validate(value, field) do
     case PortableTerm.validate_local(value, field) do
       :ok ->

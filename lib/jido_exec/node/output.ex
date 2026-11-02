@@ -97,7 +97,7 @@ defmodule Jido.Exec.Node.Output do
          {:ok, output} <- ValueResolver.resolve(node.output, Frame.resolver_state(frame, context)),
          {:ok, output} <- validate_output(node, output, handoff?) do
       effects = Frame.effects(frame, node.effect_order)
-      complete_output(node, frame, output, effects)
+      complete_output(node, frame, output, effects, context)
     end
   end
 
@@ -113,19 +113,32 @@ defmodule Jido.Exec.Node.Output do
 
   defp validate_output(node, output, _handoff?), do: Validation.output(node.validator, output)
 
-  defp complete_output(%__MODULE__{parent_component: nil}, _frame, output, effects),
+  defp complete_output(%__MODULE__{parent_component: nil}, _frame, output, effects, _context),
     do: {:ok, output, effects}
 
   defp complete_output(
          %__MODULE__{parent_component: component},
          {:jido_nested_flow_frame, 1, _parent, _child} = frame,
          output,
-         effects
+         effects,
+         context
        ) do
-    {:ok, Frame.complete_nested(frame, component, output, effects), []}
+    {:ok,
+     Frame.complete_nested(frame, component, output, effects, Map.get(context, :frame_store)), []}
   end
 
-  defp complete_output(%__MODULE__{} = node, frame, _output, _effects) do
+  defp complete_output(
+         %__MODULE__{parent_component: component},
+         %Jido.Exec.Frame.Continuation{} = frame,
+         output,
+         effects,
+         context
+       ) do
+    {:ok,
+     Frame.complete_nested(frame, component, output, effects, Map.get(context, :frame_store)), []}
+  end
+
+  defp complete_output(%__MODULE__{} = node, frame, _output, _effects, _context) do
     {:error,
      Jido.Flow.Error.execution_error("nested Flow output has no parent frame", %{
        node: node.parent_component,
